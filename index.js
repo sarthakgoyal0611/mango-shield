@@ -1,21 +1,16 @@
-const isProd = process.env.NODE_ENV === 'production';
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
-const db = require('./db');
 const crypto = require('crypto');
+const { pool, initDb } = require('./db');
 
-function makeLeadPublicId() {
-  // 6 bytes => 12 hex chars
-  return 'LEAD-' + crypto.randomBytes(6).toString('hex').toUpperCase();
+if (process.env.NODE_ENV !== 'production') {
+  dotenv.config({ path: '.env.development' });
 }
 
-dotenv.config({
-  path:
-    process.env.NODE_ENV === 'production'
-      ? '.env.production'
-      : '.env.development',
-});
+function makeLeadPublicId() {
+  return 'LEAD-' + crypto.randomBytes(6).toString('hex').toUpperCase();
+}
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -23,7 +18,8 @@ const PORT = process.env.PORT || 4000;
 app.use(cors());
 app.use(express.json());
 
-/* ------------------ HEALTH ------------------ */
+app.get('/', (req, res) => res.send('OK')); // EB health check friendly
+
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
@@ -32,89 +28,56 @@ app.get('/health', (req, res) => {
   });
 });
 
-/* ------------------ CREATE LEAD ------------------ */
-app.post('/api/leads', (req, res) => {
-  const { name, phone, city, quantity, message } = req.body;
+app.post('/api/leads', async (req, res) => {
+  try {
+    const { name, phone, city, quantity, message } = req.body;
+    if (!name || !phone) return res.status(400).json({ message: 'Name and phone are required' });
 
-  if (!name || !phone) {
-    return res.status(400).json({
-      message: 'Name and phone are required',
-    });
+    const publicId = makeLeadPublicId();
+
+    await pool.query(
+      `INSERT INTO leads (public_id, name, phone, city, quantity, message)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [publicId, name, phone, city, quantity, message]
+    );
+
+    res.status(201).json({ id: publicId, message: 'Lead created successfully' });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ message: 'Server error' });
   }
-
-  const publicId = makeLeadPublicId();
-
-const stmt = db.prepare(`
-  INSERT INTO leads (public_id, name, phone, city, quantity, message)
-  VALUES (?, ?, ?, ?, ?, ?)
-`);
-
-const result = stmt.run(publicId, name, phone, city, quantity, message);
-
-res.status(201).json({
-  id: publicId,
-  message: 'Lead saved successfully',
 });
 
-});
-
-/* ------------------ GET ALL LEADS ------------------ */
-app.get('/api/leads', (req, res) => {
-  const rows = db
-    .prepare(`SELECT * FROM leads ORDER BY created_at DESC`)
-    .all();
-
+app.get('/api/leads', async (req, res) => {
+  const { rows } = await pool.query(`SELECT * FROM leads ORDER BY created_at DESC`);
   res.json(rows);
 });
 
-/* ------------------ GET SINGLE LEAD ------------------ */
-app.get('/api/leads/:id', (req, res) => {
+app.get('/api/leads/:id', async (req, res) => {
   const { id } = req.params;
-
-  const lead = db
-    .prepare(`SELECT * FROM leads WHERE id = ?`)
-    .get(id);
-
-  if (!lead) {
-    return res.status(404).json({
-      message: 'Lead not found',
-    });
-  }
-
-  res.json(lead);
+  const { rows } = await pool.query(`SELECT * FROM leads WHERE public_id=$1`, [id]);
+  if (!rows[0]) return res.status(404).json({ message: 'Lead not found' });
+  res.json(rows[0]);
 });
 
-/* ------------------ DELETE LEAD ------------------ */
-app.delete('/api/leads/:id', (req, res) => {
+app.delete('/api/leads/:id', async (req, res) => {
   const { id } = req.params;
+  const result = await pool.query(`DELETE FROM leads WHERE public_id=$1`, [id]);
+  if (result.rowCount === 0) return res.status(404).json({ message: 'Lead not found' });
+  res.json({ message: 'Lead deleted successfully' });
+});
 
-  const result = db
-    .prepare(`DELETE FROM leads WHERE id = ?`)
-    .run(id);
+app.get('/api/stats', async (req, res) => {
+  const { rows } = await pool.query(`SELECT COUNT(*)::int AS count FROM leads`);
+  res.json({ totalLeads: rows[0].count });
+});
 
-  if (result.changes === 0) {
-    return res.status(404).json({
-      message: 'Lead not found',
-    });
+(async () => {
+  try {
+    await initDb();
+    app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
+  } catch (e) {
+    console.error('DB init failed:', e);
+    process.exit(1);
   }
-
-  res.json({
-    message: 'Lead deleted successfully',
-  });
-});
-
-/* ------------------ STATS ------------------ */
-app.get('/api/stats', (req, res) => {
-  const total = db
-    .prepare(`SELECT COUNT(*) as count FROM leads`)
-    .get();
-
-  res.json({
-    totalLeads: total.count,
-  });
-});
-
-/* ------------------ START SERVER ------------------ */
-app.listen(PORT, () => {
-  console.log(`Backend running at http://localhost:${PORT}`);
-});
+})();
